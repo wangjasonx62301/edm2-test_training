@@ -19,10 +19,54 @@ from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import persistence
 from torch_utils import misc
+from torch.utils.tensorboard import SummaryWriter
+import torchvision
+
+from generate_images import generate_images, edm_sampler    
 
 #----------------------------------------------------------------------------
 # Uncertainty-based loss function (Equations 14,15,16,21) proposed in the
 # paper "Analyzing and Improving the Training Dynamics of Diffusion Models".
+
+torch.autograd.set_detect_anomaly(True)
+
+def guidance_score_scheduler(t, initial=0.05, final=0.5, T=torch.tensor(24000000)):
+    # exponential schedule
+    ratio = t / T
+    return initial * ((final / initial) ** ratio)
+
+def normal_and_guidance_interpolation_scheduler(t, initial=0.1, final=0.5, T=torch.tensor(24000000)):
+    # linear schedule
+    ratio = t / T
+    return initial + (final - initial) * ratio
+
+# def continuous_to_discrete(sigma, T=torch.tensor(24000000), rho=7):
+#     return ((sigma**(1/rho) - 0.002**(1/rho)) / (80**(1/rho) - 0.002**(1/rho)) * T).long()
+
+def continuous_to_discrete(sigma, T=24000000, sigma_min=0.002, sigma_max=80):
+    sigma = sigma.to(torch.float32)
+    return (sigma * T).long()
+
+# def discrete_to_continuous(t, T=torch.tensor(24000000), rho=7):
+#     a = 0.002**(1/rho)
+#     b = 80**(1/rho)
+#     sigma = (a + (b - a) * (t / T))**rho
+#     sigma_norm = (sigma - 0.002) / (80 - 0.002)  
+#     return sigma_norm
+
+def discrete_to_continuous(t, T=24000000):
+    t = t.to(torch.float32)
+    return t / T
+
+def discrete_interval_scheduler(t, min_interval=10, max_interval=10000, T=240000000):
+    ratio = t / T
+    return (min_interval + (max_interval - min_interval) * ratio).long() if type(min_interval) is int else (min_interval + (max_interval - min_interval) * ratio).float()
+    
+
+def forward_process_to_noise(x0, sigma, sigma_data=0.5):
+    """Convert clean images to noisy images."""
+    noise = torch.randn_like(x0)
+    return x0 * (sigma_data / (sigma**2 + sigma_data**2).sqrt()) + noise * (sigma**2 / (sigma**2 + sigma_data**2)).sqrt()
 
 @persistence.persistent_class
 class EDM2Loss:
@@ -30,15 +74,77 @@ class EDM2Loss:
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
+        self.guidance_scale = 2.0
+        self.sigma_gap = -0.03
+        self.g_score_schedule = 0.0001
 
-    def __call__(self, net, images, labels=None):
+    def __call__(self, net, images, labels=None, global_step=None):
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+        # first sigma
+        T = 240000000
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+        # sigma_s
+        # sigma_s = torch.clamp(sigma.clone() - 0.001, min=0.0)
+        # discrete step
+        
+        # mode
+        mode = 'dis_2_cont_with_linear_and_scheduler'
+        
+        sigma_discrete = continuous_to_discrete(sigma)
+        
+        interval = discrete_interval_scheduler(sigma_discrete, T=torch.tensor(T).to(images.device))
+        
+        self_g_interval = discrete_interval_scheduler(global_step, T=torch.tensor(T).to(images.device), min_interval=1.5, max_interval=5.0)
+        
+        sigma_s_discrete = torch.clamp(sigma_discrete - interval, min=0)
+        sigma_s = discrete_to_continuous(sigma_s_discrete)
+        g_score_scale = guidance_score_scheduler(global_step, T=torch.tensor(T).to(images.device))
+        # dist.print0(f'global_step: {global_step}, g_score_scale: {g_score_scale}')
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+        # primary noise
         noise = torch.randn_like(images) * sigma
+        # secondary noise
+        # noise_s = torch.randn_like(images) * sigma_s
+        
         denoised, logvar = net(images + noise, sigma, labels, return_logvar=True)
+        noise_s = forward_process_to_noise(denoised, sigma_s, self.sigma_data)
+        denoised_s, _ = net((images + noise_s), sigma_s, labels, return_logvar=True)
+        guidance = denoised + self_g_interval * (denoised - denoised_s)
+        
+        # guidance = (guidance - images).square().mean(dim=[1,2,3])
+        # dist.print0(f'guidance distance mean: {torch.mean(torch.abs(denoised - denoised_s))}')
+        
+        g_score = g_score_scale * guidance
         loss = (weight / logvar.exp()) * ((denoised - images) ** 2) + logvar
-        return loss
+        loss_guidance = g_score.mean()
+        dist.print0(f'logvar {logvar.mean().item():.4f}, weight {weight.mean().item():.4f}, g_score_scale {g_score_scale:.12f}, g_score {g_score.mean().item():.12f}, loss {loss.mean().item():.4f}, discrete sigma {sigma_discrete.float().mean().item():.1f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}, sigma_s discrete {sigma_s_discrete.float().mean().item():.1f}')
+
+        # loss_guidance = torch.clamp(loss_guidance, min=0.0)
+        if torch.isnan(loss_guidance) or torch.isinf(loss_guidance):
+            loss_guidance = torch.tensor(0.0, device=images.device)
+            dist.print0('warning: nan guidance loss!')
+        
+        # scheduled interpolation between normal loss and guidance loss
+        interp_alpha = normal_and_guidance_interpolation_scheduler(global_step, T=torch.tensor(T).to(images.device))
+        loss = (1 - interp_alpha) * loss + interp_alpha * loss_guidance
+        
+        # loss = loss.mean() + loss_guidance
+        training_mode = f"{T}-{mode}"
+        return loss, g_score_scale, training_mode
+        
+        # rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
+        # sigma = (rnd_normal * self.P_std + self.P_mean).exp()
+        # # sigma_s
+        # sigma_s = torch.clamp(sigma.clone() + 0.03, max=1.0)
+        # noise_s = torch.randn_like(images) * sigma_s
+
+        # weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+        # noise = torch.randn_like(images) * sigma
+        # denoised, logvar = net(images + noise, sigma, labels, return_logvar=True)
+        # denoised_s, _ = net((images + noise_s), sigma_s, labels, return_logvar=True)
+
+        # loss = (weight / logvar.exp()) * ((denoised - images) ** 2) + logvar
+        # return loss
 
 #----------------------------------------------------------------------------
 # Learning rate decay schedule used in the paper "Analyzing and Improving
@@ -79,6 +185,7 @@ def training_loop(
     force_finite        = True,     # Get rid of NaN/Inf gradients before feeding them to the optimizer.
     cudnn_benchmark     = True,     # Enable torch.backends.cudnn.benchmark?
     device              = torch.device('cuda'),
+    eval_interval       = None,     # Interval for evaluating FID and saving sample images. None = disable.
 ):
     # Initialize.
     prev_status_time = time.time()
@@ -131,6 +238,15 @@ def training_loop(
     # Load previous checkpoint and decide how long to train.
     checkpoint = dist.CheckpointIO(state=state, net=net, loss_fn=loss_fn, optimizer=optimizer, ema=ema)
     checkpoint.load_latest(run_dir)
+    
+    # tensorboard summary writer
+    writer = None
+    if dist.get_rank() in [0, 1, 2, 3]:
+        tb_log_dir = os.path.join(run_dir, 'tensorboard')
+        os.makedirs(tb_log_dir, exist_ok=True)
+        writer = SummaryWriter(log_dir=tb_log_dir)
+        dist.print0(f'create tensorboard summary writer at {tb_log_dir}')
+    
     stop_at_nimg = total_nimg
     if slice_nimg is not None:
         granularity = checkpoint_nimg if checkpoint_nimg is not None else snapshot_nimg if snapshot_nimg is not None else batch_size
@@ -147,7 +263,8 @@ def training_loop(
     cumulative_training_time = 0
     start_nimg = state.cur_nimg
     stats_jsonl = None
-    while True:
+    loss_history = []
+    while True and state.cur_nimg < 24000000:
         done = (state.cur_nimg >= stop_at_nimg)
 
         # Report status.
@@ -173,7 +290,7 @@ def training_loop(
 
             # Flush training stats.
             training_stats.default_collector.update()
-            if dist.get_rank() == 0:
+            if dist.get_rank() in [0, 1, 2, 3]:
                 if stats_jsonl is None:
                     stats_jsonl = open(os.path.join(run_dir, 'stats.jsonl'), 'at')
                 fmt = {'Progress/tick': '%.0f', 'Progress/kimg': '%.3f', 'timestamp': '%.3f'}
@@ -181,6 +298,28 @@ def training_loop(
                 items = [f'"{name}": ' + (fmt.get(name, '%g') % value if np.isfinite(value) else 'NaN') for name, value in items]
                 stats_jsonl.write('{' + ', '.join(items) + '}\n')
                 stats_jsonl.flush()
+                
+                # also write to tensorboard
+                try:
+                    if writer is not None:
+                        stats_dict = training_stats.default_collector.as_dict()
+                        # write scalar metrics
+                        for name, val in stats_dict.items():
+                            try:
+                                writer.add_scalar(name, float(val.mean), state.cur_nimg)
+                            except Exception:
+                                # ignore any weird metric formatting
+                                pass
+                        # some additional useful scalars
+                        writer.add_scalar('Resources/cpu_mem_gb', cpu_memory_usage / 2**30, state.cur_nimg)
+                        try:
+                            writer.add_scalar('Resources/peak_gpu_mem_gb', torch.cuda.max_memory_allocated(device) / 2**30, state.cur_nimg)
+                            writer.add_scalar('Resources/peak_gpu_mem_reserved_gb', torch.cuda.max_memory_reserved(device) / 2**30, state.cur_nimg)
+                        except Exception:
+                            pass
+                        writer.flush()
+                except Exception as e:
+                    dist.print0(f'Warning: TensorBoard writer failed to write stats: {e}')
 
             # Update progress and check for abort.
             dist.update_progress(state.cur_nimg // 1000, stop_at_nimg // 1000)
@@ -188,7 +327,7 @@ def training_loop(
                 dist.request_suspend()
             if dist.should_stop() or dist.should_suspend():
                 done = True
-
+        
         # Save network snapshot.
         if snapshot_nimg is not None and state.cur_nimg % snapshot_nimg == 0 and (state.cur_nimg != start_nimg or start_nimg == 0) and dist.get_rank() == 0:
             ema_list = ema.get() if ema is not None else optimizer.get_ema(net) if hasattr(optimizer, 'get_ema') else net
@@ -211,7 +350,10 @@ def training_loop(
         # Done?
         if done:
             break
-
+        
+        g_score_scale = None
+        scalar_loss = None
+        training_mode = None
         # Evaluate loss and accumulate gradients.
         batch_start_time = time.time()
         misc.set_random_seed(seed, dist.get_rank(), state.cur_nimg)
@@ -220,15 +362,40 @@ def training_loop(
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
                 images = encoder.encode_latents(images.to(device))
-                loss = loss_fn(net=ddp, images=images, labels=labels.to(device))
+                loss, g_score_scale, training_mode = loss_fn(net=ddp, images=images, labels=labels.to(device), global_step=state.cur_nimg)
                 training_stats.report('Loss/loss', loss)
+                scalar_loss = float(loss.mean().detach().cpu().item())
+                dist.print0(f'mean loss: {np.mean(loss_history[:-100])}, cur loss: {scalar_loss}')
+                if len(loss_history) > 100 and not scalar_loss - 0.5 < np.mean(loss_history[:-100]) < scalar_loss + 0.5:
+                    dist.print0(f'mean loss: {np.mean(loss_history[:-100])}, cur loss: {scalar_loss}')
+                    dist.print0('warning: loss seems to be stuck, breaking out of training loop')
+                    loss_history.append(scalar_loss)
+                    del scalar_loss, loss, g_score_scale
+                    continue
+                loss_history.append(scalar_loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
+                
+        if dist.get_rank() in [0, 1, 2, 3] and writer is not None:
+            try:
+                # dist.print0(f'cur_nimg: {state.cur_nimg}, loss: {scalar_loss}')
+                writer.add_scalar(f'Train-{training_mode}-{dist.get_rank()}/loss_step', scalar_loss, state.cur_nimg)
+                writer.add_scalar(f'Train-{training_mode}-{dist.get_rank()}/guidance_scale', g_score_scale, state.cur_nimg)
+            except Exception:
+                pass
+                # loss_guidance.backward()
 
         # Run optimizer and update weights.
         lr = dnnlib.util.call_func_by_name(cur_nimg=state.cur_nimg, batch_size=batch_size, **lr_kwargs)
         training_stats.report('Loss/learning_rate', lr)
         for g in optimizer.param_groups:
             g['lr'] = lr
+
+        if dist.get_rank() in [0, 1, 2, 3] and writer is not None:
+            try:
+                writer.add_scalar(f'Train-{training_mode}-{dist.get_rank()}/learning_rate', lr, state.cur_nimg)
+            except Exception:
+                pass
+            
         if force_finite:
             for param in net.parameters():
                 if param.grad is not None:
@@ -240,5 +407,38 @@ def training_loop(
         if ema is not None:
             ema.update(cur_nimg=state.cur_nimg, batch_size=batch_size)
         cumulative_training_time += time.time() - batch_start_time
+        
+        if state.cur_nimg != 0 and state.cur_nimg % status_nimg == 0 and dist.get_rank() == 0 and writer is not None:
+        
+            dist.print0(f'=== eval at {state.cur_nimg // 1000} kimg ===')
+            # generate sample images
+            fix_seeds = [0, 1, 2, 3]
+            net_ema = ema.get()[0][0] if ema is not None else net
+            image_iter = generate_images(
+                net=net_ema,
+                gnet=None,
+                encoder=encoder,
+                outdir=None,
+                seeds=fix_seeds,
+                device=device,
+                max_batch_size=16,
+                sampler_fn=edm_sampler,
+                num_steps=32,
+                sigma_min=0.002,
+                sigma_max=80,
+                rho=7,
+            )
+            
+            for r in image_iter:
+                # print(r.images.dtype, r.images.min().item(), r.images.max().item())
+                grid = torchvision.utils.make_grid(r.images, nrow=len(fix_seeds),)
+                writer.add_image(f'Train-{training_mode}-{dist.get_rank()}/fixed_samples_{state.cur_nimg}', grid, state.cur_nimg)
+                break
+        
+    if dist.get_rank() in [0, 1, 2, 3] and writer is not None:
+        try:
+            writer.close()
+        except Exception:
+            pass
 
 #----------------------------------------------------------------------------

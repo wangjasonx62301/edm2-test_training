@@ -96,9 +96,9 @@ class MPConv(torch.nn.Module):
 
     def forward(self, x, gain=1):
         w = self.weight.to(torch.float32)
-        if self.training:
-            with torch.no_grad():
-                self.weight.copy_(normalize(w)) # forced weight normalization
+        # if self.training:
+        #     with torch.no_grad():
+        #         self.weight.copy_(normalize(w)) # forced weight normalization
         w = normalize(w) # traditional weight normalization
         w = w * (gain / np.sqrt(w[0].numel())) # magnitude-preserving scaling
         w = w.to(x.dtype)

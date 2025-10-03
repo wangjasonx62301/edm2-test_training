@@ -29,6 +29,7 @@ warnings.filterwarnings('ignore', '1Torch was not compiled with flash attention'
 model_root = 'https://nvlabs-fi-cdn.nvidia.com/edm2/posthoc-reconstructions'
 
 config_presets = {
+    'edm2-cifar10':                    dnnlib.EasyDict(net='/home/jasonx62301/for_python/edm2-test_training/.training-runs/00007-edm2-cifar10/network-snapshot-0023592-0.100.pkl'), #
     'edm2-img512-xs-fid':              dnnlib.EasyDict(net=f'{model_root}/edm2-img512-xs-2147483-0.135.pkl'),      # fid = 3.53
     'edm2-img512-xs-dino':             dnnlib.EasyDict(net=f'{model_root}/edm2-img512-xs-2147483-0.200.pkl'),      # fd_dinov2 = 103.39
     'edm2-img512-s-fid':               dnnlib.EasyDict(net=f'{model_root}/edm2-img512-s-2147483-0.130.pkl'),       # fid = 2.56
