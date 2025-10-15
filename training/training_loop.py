@@ -30,12 +30,13 @@ from generate_images import generate_images, edm_sampler
 
 torch.autograd.set_detect_anomaly(True)
 
-def guidance_score_scheduler(t, initial=0.05, final=0.5, T=torch.tensor(24000000)):
+def guidance_score_scheduler(t, initial=0.5, final=2.5, T=torch.tensor(24000000)):
     # exponential schedule
     ratio = t / T
     return initial * ((final / initial) ** ratio)
+    # return initial + (final - initial) * ratio
 
-def normal_and_guidance_interpolation_scheduler(t, initial=0.1, final=0.5, T=torch.tensor(24000000)):
+def normal_and_guidance_interpolation_scheduler(t, initial=0.3, final=0.5, T=torch.tensor(24000000)):
     # linear schedule
     ratio = t / T
     return initial + (final - initial) * ratio
@@ -58,7 +59,7 @@ def discrete_to_continuous(t, T=24000000):
     t = t.to(torch.float32)
     return t / T
 
-def discrete_interval_scheduler(t, min_interval=10, max_interval=10000, T=240000000):
+def discrete_interval_scheduler(t, min_interval=10, max_interval=10000, T=24000000):
     ratio = t / T
     return (min_interval + (max_interval - min_interval) * ratio).long() if type(min_interval) is int else (min_interval + (max_interval - min_interval) * ratio).float()
     
@@ -70,7 +71,7 @@ def forward_process_to_noise(x0, sigma, sigma_data=0.5):
 
 @persistence.persistent_class
 class EDM2Loss:
-    def __init__(self, P_mean=-0.4, P_std=1.0, sigma_data=0.5):
+    def __init__(self, P_mean=-1.2, P_std=1.2, sigma_data=0.5):
         self.P_mean = P_mean
         self.P_std = P_std
         self.sigma_data = sigma_data
@@ -81,24 +82,36 @@ class EDM2Loss:
     def __call__(self, net, images, labels=None, global_step=None):
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         # first sigma
-        T = 240000000
+        T = 24000000
+        P_mean_s = 0.85
+        start_guidance = False
+        guidance_min_gamma = 1.5
+        guidance_max_gamma = 2.8
+        guidance_score_scale_min = 0.001
+        guidance_score_scale_max = 0.05
+        # print(self.P_std, self.P_mean)
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
         # sigma_s
         # sigma_s = torch.clamp(sigma.clone() - 0.001, min=0.0)
         # discrete step
         
         # mode
-        mode = 'dis_2_cont_with_linear_and_scheduler'
-        
+        mode = f'dis_2_cont_with_linear_and_scheduler_GuidanceGamma_{guidance_min_gamma}-{guidance_max_gamma}_GuidanceScale_{guidance_score_scale_min}-{guidance_score_scale_max}_Pmean_{self.P_mean}_Pstd_{self.P_std}'
+
         sigma_discrete = continuous_to_discrete(sigma)
         
         interval = discrete_interval_scheduler(sigma_discrete, T=torch.tensor(T).to(images.device))
+
+        self_g_interval = discrete_interval_scheduler(global_step, T=torch.tensor(T).to(images.device), min_interval=guidance_min_gamma, max_interval=guidance_max_gamma)
+
+        # sigma_s_discrete = torch.clamp(sigma_discrete - interval, min=sigma_discrete // 2)
         
-        self_g_interval = discrete_interval_scheduler(global_step, T=torch.tensor(T).to(images.device), min_interval=1.5, max_interval=5.0)
+        # sigma_s = discrete_to_continuous(sigma_s_discrete)
+        # rnd_normal_s = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         
-        sigma_s_discrete = torch.clamp(sigma_discrete - interval, min=0)
-        sigma_s = discrete_to_continuous(sigma_s_discrete)
-        g_score_scale = guidance_score_scheduler(global_step, T=torch.tensor(T).to(images.device))
+        sigma_s = (rnd_normal * self.P_std - P_mean_s).exp()
+
+        g_score_scale = guidance_score_scheduler(global_step, T=torch.tensor(T).to(images.device), initial=guidance_score_scale_min, final=guidance_score_scale_max)
         # dist.print0(f'global_step: {global_step}, g_score_scale: {g_score_scale}')
         weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
         # primary noise
@@ -107,17 +120,19 @@ class EDM2Loss:
         # noise_s = torch.randn_like(images) * sigma_s
         
         denoised, logvar = net(images + noise, sigma, labels, return_logvar=True)
-        noise_s = forward_process_to_noise(denoised, sigma_s, self.sigma_data)
+        # noise_s = forward_process_to_noise(denoised, sigma_s, self.sigma_data)
+        noise_s = torch.randn_like(images) * sigma_s
         denoised_s, _ = net((images + noise_s), sigma_s, labels, return_logvar=True)
         guidance = denoised + self_g_interval * (denoised - denoised_s)
-        
+
         # guidance = (guidance - images).square().mean(dim=[1,2,3])
         # dist.print0(f'guidance distance mean: {torch.mean(torch.abs(denoised - denoised_s))}')
         
         g_score = g_score_scale * guidance
         loss = (weight / logvar.exp()) * ((denoised - images) ** 2) + logvar
         loss_guidance = g_score.mean()
-        dist.print0(f'logvar {logvar.mean().item():.4f}, weight {weight.mean().item():.4f}, g_score_scale {g_score_scale:.12f}, g_score {g_score.mean().item():.12f}, loss {loss.mean().item():.4f}, discrete sigma {sigma_discrete.float().mean().item():.1f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}, sigma_s discrete {sigma_s_discrete.float().mean().item():.1f}')
+        interp_alpha = normal_and_guidance_interpolation_scheduler(global_step, T=torch.tensor(T).to(images.device))
+
 
         # loss_guidance = torch.clamp(loss_guidance, min=0.0)
         if torch.isnan(loss_guidance) or torch.isinf(loss_guidance):
@@ -125,11 +140,18 @@ class EDM2Loss:
             dist.print0('warning: nan guidance loss!')
         
         # scheduled interpolation between normal loss and guidance loss
-        interp_alpha = normal_and_guidance_interpolation_scheduler(global_step, T=torch.tensor(T).to(images.device))
-        loss = (1 - interp_alpha) * loss + interp_alpha * loss_guidance
+        # if 5000000 > global_step > 600000:
+        if global_step < 600000:
+            start_guidance = True
+            loss = (1 - interp_alpha) * loss + interp_alpha * loss_guidance
+        
+        else: start_guidance = False
+        
+        dist.print0(f'start_guidance: {start_guidance} global_step {global_step}, interp_alpha {interp_alpha:.12f}, g_score_scale {g_score_scale:.12f}, g_score {g_score.mean().item():.12f}, loss {loss.mean().item():.4f}, self_g_interval {self_g_interval.mean().item():.4f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}')
+
         
         # loss = loss.mean() + loss_guidance
-        training_mode = f"{T}-{mode}"
+        training_mode = f"{T}-{mode}--{P_mean_s}"
         return loss, g_score_scale, training_mode
         
         # rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
@@ -365,9 +387,11 @@ def training_loop(
                 loss, g_score_scale, training_mode = loss_fn(net=ddp, images=images, labels=labels.to(device), global_step=state.cur_nimg)
                 training_stats.report('Loss/loss', loss)
                 scalar_loss = float(loss.mean().detach().cpu().item())
-                dist.print0(f'mean loss: {np.mean(loss_history[:-100])}, cur loss: {scalar_loss}')
-                if len(loss_history) > 100 and not scalar_loss - 0.5 < np.mean(loss_history[:-100]) < scalar_loss + 0.5:
-                    dist.print0(f'mean loss: {np.mean(loss_history[:-100])}, cur loss: {scalar_loss}')
+                # dist.print0(f'mean loss: {np.mean(loss_history[:-100])}, cur loss: {scalar_loss}')
+                if len(loss_history) > 100 and not \
+                scalar_loss < 2.0 and not \
+                scalar_loss - 0.15 < np.mean(loss_history[-10:]) < scalar_loss + 0.15:
+                    dist.print0(f'mean loss: {np.mean(loss_history[:-10])}, cur loss: {scalar_loss}')
                     dist.print0('warning: loss seems to be stuck, breaking out of training loop')
                     loss_history.append(scalar_loss)
                     del scalar_loss, loss, g_score_scale
