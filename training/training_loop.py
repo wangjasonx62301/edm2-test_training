@@ -59,15 +59,16 @@ def discrete_to_continuous(t, T=24000000):
     t = t.to(torch.float32)
     return t / T
 
-def discrete_interval_scheduler(t, min_interval=10, max_interval=10000, T=24000000):
+def discrete_interval_scheduler(t, min_interval=10000, max_interval=100000, T=24000000):
     ratio = t / T
     return (min_interval + (max_interval - min_interval) * ratio).long() if type(min_interval) is int else (min_interval + (max_interval - min_interval) * ratio).float()
     
 
-def forward_process_to_noise(x0, sigma, sigma_data=0.5):
+def forward_process_to_noise(x0, sigma, noise, sigma_data=0.5):
     """Convert clean images to noisy images."""
-    noise = torch.randn_like(x0)
-    return x0 * (sigma_data / (sigma**2 + sigma_data**2).sqrt()) + noise * (sigma**2 / (sigma**2 + sigma_data**2)).sqrt()
+    # noise = torch.randn_like(x0)
+    x_t = x0 + sigma * noise
+    return x_t
 
 @persistence.persistent_class
 class EDM2Loss:
@@ -81,78 +82,73 @@ class EDM2Loss:
 
     def __call__(self, net, images, labels=None, global_step=None):
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
-        # first sigma
+        ######### Parameters for schedulers ##########
         T = 24000000
         P_mean_s = 0.85
         start_guidance = False
         guidance_min_gamma = 1.5
         guidance_max_gamma = 2.8
-        guidance_score_scale_min = 0.001
-        guidance_score_scale_max = 0.05
-        # print(self.P_std, self.P_mean)
+        guidance_score_scale_min = 1e-3
+        guidance_score_scale_max = 1
+        ##############################################
+        # original sigma        
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
-        # sigma_s
-        # sigma_s = torch.clamp(sigma.clone() - 0.001, min=0.0)
-        # discrete step
-        
-        # mode
-        mode = f'dis_2_cont_with_linear_and_scheduler_GuidanceGamma_{guidance_min_gamma}-{guidance_max_gamma}_GuidanceScale_{guidance_score_scale_min}-{guidance_score_scale_max}_Pmean_{self.P_mean}_Pstd_{self.P_std}'
-
         sigma_discrete = continuous_to_discrete(sigma)
-        
+        # mode
+        mode = f'dis_2_cont_with_linear_and_scheduler_GuidanceGamma_{guidance_min_gamma}-{guidance_max_gamma}_GuidanceScale_{guidance_score_scale_min}-{guidance_score_scale_max}_Pmean_{self.P_mean}_Pstd_{self.P_std}'        
+        # interval for secondary noise
         interval = discrete_interval_scheduler(sigma_discrete, T=torch.tensor(T).to(images.device))
+        # this is for self-guidance scale, unused currently
+        # self_g_interval = discrete_interval_scheduler(global_step, T=torch.tensor(T).to(images.device), min_interval=guidance_min_gamma, max_interval=guidance_max_gamma)
 
-        self_g_interval = discrete_interval_scheduler(global_step, T=torch.tensor(T).to(images.device), min_interval=guidance_min_gamma, max_interval=guidance_max_gamma)
-
-        # sigma_s_discrete = torch.clamp(sigma_discrete - interval, min=sigma_discrete // 2)
+        ########### This is for x_t -> x_0 -> x_t-1 ############
+        sigma_s_discrete = torch.clamp(sigma_discrete - interval, min=sigma_discrete // 2)
+        sigma_s = discrete_to_continuous(sigma_s_discrete)
+        #############  End of x_t -> x_0 -> x_t-1 ##############
         
-        # sigma_s = discrete_to_continuous(sigma_s_discrete)
-        # rnd_normal_s = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
-        
-        sigma_s = (rnd_normal * self.P_std - P_mean_s).exp()
+        # this sigma_s if for simple testing
+        # sigma_s = (rnd_normal * self.P_std - P_mean_s).exp()
 
+        # guidance score scale
         g_score_scale = guidance_score_scheduler(global_step, T=torch.tensor(T).to(images.device), initial=guidance_score_scale_min, final=guidance_score_scale_max)
-        # dist.print0(f'global_step: {global_step}, g_score_scale: {g_score_scale}')
-        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
+        
         # primary noise
+        weight = (sigma ** 2 + self.sigma_data ** 2) / (sigma * self.sigma_data) ** 2
         noise = torch.randn_like(images) * sigma
-        # secondary noise
-        # noise_s = torch.randn_like(images) * sigma_s
-        
+        # primary denoising
         denoised, logvar = net(images + noise, sigma, labels, return_logvar=True)
-        # noise_s = forward_process_to_noise(denoised, sigma_s, self.sigma_data)
-        noise_s = torch.randn_like(images) * sigma_s
-        denoised_s, _ = net((images + noise_s), sigma_s, labels, return_logvar=True)
-        guidance = denoised + self_g_interval * (denoised - denoised_s)
 
-        # guidance = (guidance - images).square().mean(dim=[1,2,3])
-        # dist.print0(f'guidance distance mean: {torch.mean(torch.abs(denoised - denoised_s))}')
+        # secondary noise
+        noise_s = ((images + noise - denoised) / sigma)
+        noise_s = forward_process_to_noise(denoised, sigma_s, noise_s, self.sigma_data)
+        denoised_s, _ = net((noise_s), sigma_s, labels, return_logvar=True)
         
-        g_score = g_score_scale * guidance
+        ########## guidance loss ##########
+        guidance_primary = (denoised - denoised_s)
+        guidance_compare = (denoised - images)
+        cosine_sim = torch.nn.functional.cosine_similarity(guidance_primary.view(guidance_primary.shape[0], -1), guidance_compare.view(guidance_compare.shape[0], -1), dim=1)
+        if cosine_sim.isnan().any() or cosine_sim.isinf().any():
+            cosine_sim = torch.zeros_like(cosine_sim)
+            dist.print0('warning: nan or inf in cosine similarity!')
+        loss_guidance = (1 + 1e-9 + cosine_sim)  # want to maximize cosine similarity
+        ############ End of guidance loss ###########
+
+        # primary  loss        
         loss = (weight / logvar.exp()) * ((denoised - images) ** 2) + logvar
-        loss_guidance = g_score.mean()
-        interp_alpha = normal_and_guidance_interpolation_scheduler(global_step, T=torch.tensor(T).to(images.device))
+        
+        # combine losses
+        # loss = loss + g_score_scale * loss_guidance
+        # if global_step > 100:
+            # start_guidance = True
+        loss = torch.vmap(lambda a, b: a * b)(loss, loss_guidance)
+        # loss = loss_guidance
 
-
-        # loss_guidance = torch.clamp(loss_guidance, min=0.0)
-        if torch.isnan(loss_guidance) or torch.isinf(loss_guidance):
-            loss_guidance = torch.tensor(0.0, device=images.device)
-            dist.print0('warning: nan guidance loss!')
-        
-        # scheduled interpolation between normal loss and guidance loss
-        # if 5000000 > global_step > 600000:
-        if global_step < 600000:
-            start_guidance = True
-            loss = (1 - interp_alpha) * loss + interp_alpha * loss_guidance
-        
-        else: start_guidance = False
-        
-        dist.print0(f'start_guidance: {start_guidance} global_step {global_step}, interp_alpha {interp_alpha:.12f}, g_score_scale {g_score_scale:.12f}, g_score {g_score.mean().item():.12f}, loss {loss.mean().item():.4f}, self_g_interval {self_g_interval.mean().item():.4f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}')
+        dist.print0(f'start_guidance: {start_guidance} global_step {global_step}, guidance_loss {loss_guidance.max().item():.4f} {loss_guidance.min().item():.4f}, g_score_scale {g_score_scale:.12f}, loss {loss.mean().item():.4f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}')
 
         
         # loss = loss.mean() + loss_guidance
         training_mode = f"{T}-{mode}--{P_mean_s}"
-        return loss, g_score_scale, training_mode
+        return loss, g_score_scale, training_mode, loss_guidance
         
         # rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         # sigma = (rnd_normal * self.P_std + self.P_mean).exp()
@@ -384,8 +380,10 @@ def training_loop(
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
                 images = encoder.encode_latents(images.to(device))
-                loss, g_score_scale, training_mode = loss_fn(net=ddp, images=images, labels=labels.to(device), global_step=state.cur_nimg)
+                loss, g_score_scale, training_mode, loss_guidance = loss_fn(net=ddp, images=images, labels=labels.to(device), global_step=state.cur_nimg)
                 training_stats.report('Loss/loss', loss)
+                training_stats.report('Loss/loss_guidance', loss_guidance)
+                training_stats.report('Loss/guidance_min_max_difference', loss_guidance.max() - loss_guidance.min())
                 scalar_loss = float(loss.mean().detach().cpu().item())
                 # dist.print0(f'mean loss: {np.mean(loss_history[:-100])}, cur loss: {scalar_loss}')
                 if len(loss_history) > 100 and not \
@@ -398,7 +396,9 @@ def training_loop(
                     continue
                 loss_history.append(scalar_loss)
                 loss.sum().mul(loss_scaling / batch_gpu_total).backward()
-                
+
+                del scalar_loss, loss, g_score_scale, loss_guidance
+
         if dist.get_rank() in [0, 1, 2, 3] and writer is not None:
             try:
                 # dist.print0(f'cur_nimg: {state.cur_nimg}, loss: {scalar_loss}')
@@ -433,31 +433,33 @@ def training_loop(
         cumulative_training_time += time.time() - batch_start_time
         
         if state.cur_nimg != 0 and state.cur_nimg % status_nimg == 0 and dist.get_rank() == 0 and writer is not None:
-        
-            dist.print0(f'=== eval at {state.cur_nimg // 1000} kimg ===')
-            # generate sample images
-            fix_seeds = [0, 1, 2, 3]
-            net_ema = ema.get()[0][0] if ema is not None else net
-            image_iter = generate_images(
-                net=net_ema,
-                gnet=None,
-                encoder=encoder,
-                outdir=None,
-                seeds=fix_seeds,
-                device=device,
-                max_batch_size=16,
-                sampler_fn=edm_sampler,
-                num_steps=32,
-                sigma_min=0.002,
-                sigma_max=80,
-                rho=7,
-            )
-            
-            for r in image_iter:
-                # print(r.images.dtype, r.images.min().item(), r.images.max().item())
-                grid = torchvision.utils.make_grid(r.images, nrow=len(fix_seeds),)
-                writer.add_image(f'Train-{training_mode}-{dist.get_rank()}/fixed_samples_{state.cur_nimg}', grid, state.cur_nimg)
-                break
+            with torch.no_grad():
+                dist.print0(f'=== eval at {state.cur_nimg // 1000} kimg ===')
+                # generate sample images
+                fix_seeds = [0, 1, 2, 3]
+                net_ema = ema.get()[0][0] if ema is not None else net
+                image_iter = generate_images(
+                    net=net_ema,
+                    gnet=None,
+                    encoder=encoder,
+                    outdir=None,
+                    seeds=fix_seeds,
+                    device=device,
+                    max_batch_size=4,
+                    sampler_fn=edm_sampler,
+                    num_steps=32,
+                    sigma_min=0.002,
+                    sigma_max=80,
+                    rho=7,
+                )
+                
+                for r in image_iter:
+                    # print(r.images.dtype, r.images.min().item(), r.images.max().item())
+                    grid = torchvision.utils.make_grid(r.images, nrow=len(fix_seeds),)
+                    writer.add_image(f'Train-{training_mode}-{dist.get_rank()}/fixed_samples_{state.cur_nimg}', grid, state.cur_nimg)
+                    break
+                
+                del image_iter, net_ema
         
     if dist.get_rank() in [0, 1, 2, 3] and writer is not None:
         try:
