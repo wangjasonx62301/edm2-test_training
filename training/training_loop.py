@@ -37,9 +37,12 @@ def guidance_score_scheduler(t, initial=0.5, final=2.5, T=torch.tensor(24000000)
     # return initial + (final - initial) * ratio
 
 def normal_and_guidance_interpolation_scheduler(t, initial=0.3, final=0.5, T=torch.tensor(24000000)):
-    # linear schedule
+    # log schedule
     ratio = t / T
-    return initial + (final - initial) * ratio
+    log_initial = torch.log(torch.tensor(initial))
+    log_final = torch.log(torch.tensor(final))
+    value = torch.exp(log_initial + (log_final - log_initial) * ratio)
+    return value
 
 # def continuous_to_discrete(sigma, T=torch.tensor(24000000), rho=7):
 #     return ((sigma**(1/rho) - 0.002**(1/rho)) / (80**(1/rho) - 0.002**(1/rho)) * T).long()
@@ -130,25 +133,26 @@ class EDM2Loss:
         if cosine_sim.isnan().any() or cosine_sim.isinf().any():
             cosine_sim = torch.zeros_like(cosine_sim)
             dist.print0('warning: nan or inf in cosine similarity!')
-        loss_guidance = (1 + 1e-9 + cosine_sim)  # want to maximize cosine similarity
+        loss_guidance = (1 + 1e-9 - cosine_sim.mean())  # want to maximize cosine similarity
         ############ End of guidance loss ###########
 
         # primary  loss        
         loss = (weight / logvar.exp()) * ((denoised - images) ** 2) + logvar
         
         # combine losses
-        # loss = loss + g_score_scale * loss_guidance
+        interpolation = normal_and_guidance_interpolation_scheduler(global_step, T=torch.tensor(T).to(images.device), initial=0.1, final=0.8)
+        # loss = (1 - interpolation) * loss + interpolation * g_score_scale * loss_guidance
         # if global_step > 100:
             # start_guidance = True
-        loss = torch.vmap(lambda a, b: a * b)(loss, loss_guidance)
+        # loss = torch.vmap(lambda a, b: a * b)(loss, loss_guidance)
         # loss = loss_guidance
-
-        dist.print0(f'start_guidance: {start_guidance} global_step {global_step}, guidance_loss {loss_guidance.max().item():.4f} {loss_guidance.min().item():.4f}, g_score_scale {g_score_scale:.12f}, loss {loss.mean().item():.4f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}')
+        
+        dist.print0(f'interpolation {interpolation} global_step {global_step}, guidance_loss {loss_guidance.max().item():.4f} {loss_guidance.min().item():.4f}, g_score_scale {g_score_scale:.12f}, loss {loss.mean().item():.4f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}')
 
         
         # loss = loss.mean() + loss_guidance
         training_mode = f"{T}-{mode}--{P_mean_s}"
-        return loss, g_score_scale, training_mode, loss_guidance
+        return loss, g_score_scale, training_mode, loss_guidance, interpolation
         
         # rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         # sigma = (rnd_normal * self.P_std + self.P_mean).exp()
@@ -380,10 +384,11 @@ def training_loop(
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
                 images = encoder.encode_latents(images.to(device))
-                loss, g_score_scale, training_mode, loss_guidance = loss_fn(net=ddp, images=images, labels=labels.to(device), global_step=state.cur_nimg)
+                loss, g_score_scale, training_mode, loss_guidance, interpolation = loss_fn(net=ddp, images=images, labels=labels.to(device), global_step=state.cur_nimg)
                 training_stats.report('Loss/loss', loss)
                 training_stats.report('Loss/loss_guidance', loss_guidance)
                 training_stats.report('Loss/guidance_min_max_difference', loss_guidance.max() - loss_guidance.min())
+                training_stats.report('Loss/interpolation', interpolation)
                 scalar_loss = float(loss.mean().detach().cpu().item())
                 # dist.print0(f'mean loss: {np.mean(loss_history[:-100])}, cur loss: {scalar_loss}')
                 if len(loss_history) > 100 and not \
