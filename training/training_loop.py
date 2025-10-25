@@ -142,8 +142,7 @@ class EDM2Loss:
         # combine losses
         interpolation = normal_and_guidance_interpolation_scheduler(global_step, T=torch.tensor(T).to(images.device), initial=0.1, final=0.8)
         # loss = (1 - interpolation) * loss + interpolation * g_score_scale * loss_guidance
-        # if global_step > 100:
-            # start_guidance = True
+
         # loss = torch.vmap(lambda a, b: a * b)(loss, loss_guidance)
         # loss = loss_guidance
         
