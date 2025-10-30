@@ -28,7 +28,25 @@ from generate_images import generate_images, edm_sampler
 # Uncertainty-based loss function (Equations 14,15,16,21) proposed in the
 # paper "Analyzing and Improving the Training Dynamics of Diffusion Models".
 
-torch.autograd.set_detect_anomaly(True)
+# torch.autograd.set_detect_anomaly(True)
+
+# def inplace_normalize_model_weights(model):
+#     from training.networks_edm2 import MPConv, normalize 
+    
+#     with torch.no_grad():
+#         for module in model.modules():
+#             if isinstance(module, MPConv):
+#                 w = module.weight.to(torch.float32)
+#                 module.weight.copy_(normalize(w))
+
+def normalize_model_weights(model):
+    from torch_utils import misc  
+    from training.networks_edm2 import MPConv, normalize
+
+    with torch.no_grad():
+        for module in model.modules():
+            if isinstance(module, MPConv):
+                module.weight.copy_(normalize(module.weight))
 
 def guidance_score_scheduler(t, initial=0.5, final=2.5, T=torch.tensor(24000000)):
     # exponential schedule
@@ -83,6 +101,7 @@ class EDM2Loss:
         self.sigma_gap = -0.03
         self.g_score_schedule = 0.0001
 
+
     def __call__(self, net, images, labels=None, global_step=None):
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         ######### Parameters for schedulers ##########
@@ -120,12 +139,12 @@ class EDM2Loss:
         noise = torch.randn_like(images) * sigma
         # primary denoising
         denoised, logvar = net(images + noise, sigma, labels, return_logvar=True)
-
+        # inplace_normalize_model_weights(net)
         # secondary noise
         noise_s = ((images + noise - denoised) / sigma)
         noise_s = forward_process_to_noise(denoised, sigma_s, noise_s, self.sigma_data)
         denoised_s, _ = net((noise_s), sigma_s, labels, return_logvar=True)
-        
+        # inplace_normalize_model_weights(net)
         ########## guidance loss ##########
         guidance_primary = (denoised - denoised_s)
         guidance_compare = (denoised - images)
@@ -134,6 +153,7 @@ class EDM2Loss:
             cosine_sim = torch.zeros_like(cosine_sim)
             dist.print0('warning: nan or inf in cosine similarity!')
         loss_guidance = (1 + 1e-9 - cosine_sim.mean())  # want to maximize cosine similarity
+        # loss_guidance = 0
         ############ End of guidance loss ###########
 
         # primary  loss        
@@ -145,8 +165,8 @@ class EDM2Loss:
 
         # loss = torch.vmap(lambda a, b: a * b)(loss, loss_guidance)
         # loss = loss_guidance
-        
-        dist.print0(f'interpolation {interpolation} global_step {global_step}, guidance_loss {loss_guidance.max().item():.4f} {loss_guidance.min().item():.4f}, g_score_scale {g_score_scale:.12f}, loss {loss.mean().item():.4f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}')
+
+        dist.print0(f'interpolation {interpolation} global_step {global_step}, guidance_loss {loss_guidance}, g_score_scale {g_score_scale:.12f}, loss {loss.mean().item():.4f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}')
 
         
         # loss = loss.mean() + loss_guidance
@@ -430,6 +450,10 @@ def training_loop(
                     torch.nan_to_num(param.grad, nan=0, posinf=0, neginf=0, out=param.grad)
         optimizer.step()
 
+        # with torch.no_grad():
+        #     normalize_model_weights(ddp.module)
+        normalize_model_weights(ddp)
+        
         # Update EMA and training state.
         state.cur_nimg += batch_size
         if ema is not None:
