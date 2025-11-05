@@ -95,6 +95,7 @@ class MPConv(torch.nn.Module):
         self.weight = torch.nn.Parameter(torch.randn(out_channels, in_channels, *kernel))
 
     def forward(self, x, gain=1):
+        w = getattr(self, "_normalized_weight", self.weight)
         w = self.weight.to(torch.float32)
         # if self.training:
         #     with torch.no_grad():

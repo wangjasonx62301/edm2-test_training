@@ -42,19 +42,20 @@ from generate_images import generate_images, edm_sampler
 def normalize_model_weights(model):
     from torch_utils import misc  
     from training.networks_edm2 import MPConv, normalize
-
+    # print(list(model.modules()))
     with torch.no_grad():
-        for module in model.modules():
+        for module in model.children():
             if isinstance(module, MPConv):
                 module.weight.copy_(normalize(module.weight))
+            else: normalize_model_weights(module)
 
-def guidance_score_scheduler(t, initial=0.5, final=2.5, T=torch.tensor(24000000)):
+def guidance_score_scheduler(t, initial=0.5, final=2.5, T=torch.tensor(36000000)):
     # exponential schedule
     ratio = t / T
     return initial * ((final / initial) ** ratio)
     # return initial + (final - initial) * ratio
 
-def normal_and_guidance_interpolation_scheduler(t, initial=0.3, final=0.5, T=torch.tensor(24000000)):
+def normal_and_guidance_interpolation_scheduler(t, initial=0.3, final=0.5, T=torch.tensor(36000000)):
     # log schedule
     ratio = t / T
     log_initial = torch.log(torch.tensor(initial))
@@ -65,7 +66,7 @@ def normal_and_guidance_interpolation_scheduler(t, initial=0.3, final=0.5, T=tor
 # def continuous_to_discrete(sigma, T=torch.tensor(24000000), rho=7):
 #     return ((sigma**(1/rho) - 0.002**(1/rho)) / (80**(1/rho) - 0.002**(1/rho)) * T).long()
 
-def continuous_to_discrete(sigma, T=24000000, sigma_min=0.002, sigma_max=80):
+def continuous_to_discrete(sigma, T=36000000, sigma_min=0.002, sigma_max=80):
     sigma = sigma.to(torch.float32)
     return (sigma * T).long()
 
@@ -76,11 +77,11 @@ def continuous_to_discrete(sigma, T=24000000, sigma_min=0.002, sigma_max=80):
 #     sigma_norm = (sigma - 0.002) / (80 - 0.002)  
 #     return sigma_norm
 
-def discrete_to_continuous(t, T=24000000):
+def discrete_to_continuous(t, T=36000000):
     t = t.to(torch.float32)
     return t / T
 
-def discrete_interval_scheduler(t, min_interval=10000, max_interval=100000, T=24000000):
+def discrete_interval_scheduler(t, min_interval=10000, max_interval=100000, T=36000000):
     ratio = t / T
     return (min_interval + (max_interval - min_interval) * ratio).long() if type(min_interval) is int else (min_interval + (max_interval - min_interval) * ratio).float()
     
@@ -105,13 +106,15 @@ class EDM2Loss:
     def __call__(self, net, images, labels=None, global_step=None):
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         ######### Parameters for schedulers ##########
-        T = 24000000
+        T = 36000000
         P_mean_s = 0.85
         start_guidance = False
         guidance_min_gamma = 1.5
         guidance_max_gamma = 2.8
-        guidance_score_scale_min = 1e-3
-        guidance_score_scale_max = 1
+        guidance_score_scale_min = 1e-6
+        guidance_score_scale_max = 1e-1
+        min_interval = 10000
+        max_interval = 100000
         ##############################################
         # original sigma        
         sigma = (rnd_normal * self.P_std + self.P_mean).exp()
@@ -119,10 +122,10 @@ class EDM2Loss:
         # mode
         mode = f'dis_2_cont_with_linear_and_scheduler_GuidanceGamma_{guidance_min_gamma}-{guidance_max_gamma}_GuidanceScale_{guidance_score_scale_min}-{guidance_score_scale_max}_Pmean_{self.P_mean}_Pstd_{self.P_std}'        
         # interval for secondary noise
-        interval = discrete_interval_scheduler(sigma_discrete, T=torch.tensor(T).to(images.device))
+        interval = discrete_interval_scheduler(sigma_discrete, min_interval=min_interval, max_interval=max_interval, T=torch.tensor(T).to(images.device))
         # this is for self-guidance scale, unused currently
         # self_g_interval = discrete_interval_scheduler(global_step, T=torch.tensor(T).to(images.device), min_interval=guidance_min_gamma, max_interval=guidance_max_gamma)
-
+        # interval = (min_interval + max_interval) - interval
         ########### This is for x_t -> x_0 -> x_t-1 ############
         sigma_s_discrete = torch.clamp(sigma_discrete - interval, min=sigma_discrete // 2)
         sigma_s = discrete_to_continuous(sigma_s_discrete)
@@ -160,13 +163,16 @@ class EDM2Loss:
         loss = (weight / logvar.exp()) * ((denoised - images) ** 2) + logvar
         
         # combine losses
-        interpolation = normal_and_guidance_interpolation_scheduler(global_step, T=torch.tensor(T).to(images.device), initial=0.1, final=0.8)
-        # loss = (1 - interpolation) * loss + interpolation * g_score_scale * loss_guidance
-
+        interpolation = normal_and_guidance_interpolation_scheduler(global_step, T=torch.tensor(T).to(images.device), initial=0.1, final=0.7)
+        
+        # if global_step < 15340000:
+        #     start_guidance = True
+        loss = loss + g_score_scale * loss_guidance
+        # else: start_guidance = False
         # loss = torch.vmap(lambda a, b: a * b)(loss, loss_guidance)
         # loss = loss_guidance
 
-        dist.print0(f'interpolation {interpolation} global_step {global_step}, guidance_loss {loss_guidance}, g_score_scale {g_score_scale:.12f}, loss {loss.mean().item():.4f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}')
+        dist.print0(f'guidance start: {start_guidance}, interpolation {interpolation} global_step {global_step}, guidance_loss {loss_guidance}, g_score_scale {g_score_scale:.12f}, loss {loss.mean().item():.4f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}')
 
         
         # loss = loss.mean() + loss_guidance
@@ -305,7 +311,7 @@ def training_loop(
     start_nimg = state.cur_nimg
     stats_jsonl = None
     loss_history = []
-    while True and state.cur_nimg < 24000000:
+    while True and state.cur_nimg < 36000000:
         done = (state.cur_nimg >= stop_at_nimg)
 
         # Report status.
@@ -452,7 +458,7 @@ def training_loop(
 
         # with torch.no_grad():
         #     normalize_model_weights(ddp.module)
-        normalize_model_weights(ddp)
+        normalize_model_weights(ddp.module)
         
         # Update EMA and training state.
         state.cur_nimg += batch_size
