@@ -7,6 +7,7 @@
 
 """Main training loop."""
 
+import math
 import os
 import time
 import copy
@@ -15,11 +16,13 @@ import psutil
 import numpy as np
 import torch
 import dnnlib
+from torch.nn import functional as F
 from torch_utils import distributed as dist
 from torch_utils import training_stats
 from torch_utils import persistence
 from torch_utils import misc
 from torch.utils.tensorboard import SummaryWriter
+import torch.distributions as beta_dist
 import torchvision
 
 from generate_images import generate_images, edm_sampler    
@@ -49,13 +52,13 @@ def normalize_model_weights(model):
                 module.weight.copy_(normalize(module.weight))
             else: normalize_model_weights(module)
 
-def guidance_score_scheduler(t, initial=0.5, final=2.5, T=torch.tensor(36000000)):
+def guidance_score_scheduler(t, initial=0.5, final=2.5, T=torch.tensor(24000000)):
     # exponential schedule
     ratio = t / T
     return initial * ((final / initial) ** ratio)
     # return initial + (final - initial) * ratio
 
-def normal_and_guidance_interpolation_scheduler(t, initial=0.3, final=0.5, T=torch.tensor(36000000)):
+def normal_and_guidance_interpolation_scheduler(t, initial=0.3, final=0.5, T=torch.tensor(24000000)):
     # log schedule
     ratio = t / T
     log_initial = torch.log(torch.tensor(initial))
@@ -66,7 +69,7 @@ def normal_and_guidance_interpolation_scheduler(t, initial=0.3, final=0.5, T=tor
 # def continuous_to_discrete(sigma, T=torch.tensor(24000000), rho=7):
 #     return ((sigma**(1/rho) - 0.002**(1/rho)) / (80**(1/rho) - 0.002**(1/rho)) * T).long()
 
-def continuous_to_discrete(sigma, T=36000000, sigma_min=0.002, sigma_max=80):
+def continuous_to_discrete(sigma, T=24000000, sigma_min=0.002, sigma_max=80):
     sigma = sigma.to(torch.float32)
     return (sigma * T).long()
 
@@ -77,11 +80,47 @@ def continuous_to_discrete(sigma, T=36000000, sigma_min=0.002, sigma_max=80):
 #     sigma_norm = (sigma - 0.002) / (80 - 0.002)  
 #     return sigma_norm
 
-def discrete_to_continuous(t, T=36000000):
+prev_loss = {'primary': None, 'guidance': None}
+
+def beta_schedule(step, total_steps=24000000, alpha=1.0, beta=0.3, scale=0.7):
+    frac = min(0.999, max(0.001, step / total_steps))
+    dist = beta_dist.Beta(alpha, beta)
+    weight = dist.log_prob(torch.tensor(frac)).exp()
+    return weight * scale
+
+def temp_schedule(step, total_steps=24000000, T0=1.5, gamma=1.2):
+    frac = min(1.0, step / total_steps)
+    k = 10 
+    center = 0.68
+    return T0 * (1 + gamma * (1 / (1 + math.exp(-k * (frac - center)))))
+
+def slope_based_scheduler(primary_loss, guidance_loss, T=2.0, bias_main=3.0, step=None):
+    global prev_loss
+    if prev_loss['primary'] is None:
+        prev_loss['primary'] = primary_loss
+        prev_loss['guidance'] = guidance_loss
+        return torch.tensor([1.0, 1e-6], device=primary_loss.device)
+    
+    r_main = primary_loss.item() / (prev_loss['primary'] + 1e-8)
+    r_guidance = guidance_loss.item() / (prev_loss['guidance'] + 1e-8)
+    
+    if step is not None:
+        # T = temp_schedule(step)
+        T = beta_schedule(step)
+        
+    rates = torch.tensor([r_main * bias_main, r_guidance], device=primary_loss.device)
+    weights = F.softmax(rates / T, dim=0)
+    
+    prev_loss['primary'] = primary_loss
+    prev_loss['guidance'] = guidance_loss
+    return weights
+    
+
+def discrete_to_continuous(t, T=24000000):
     t = t.to(torch.float32)
     return t / T
 
-def discrete_interval_scheduler(t, min_interval=10000, max_interval=100000, T=36000000):
+def discrete_interval_scheduler(t, min_interval=10000, max_interval=100000, T=24000000):
     ratio = t / T
     return (min_interval + (max_interval - min_interval) * ratio).long() if type(min_interval) is int else (min_interval + (max_interval - min_interval) * ratio).float()
     
@@ -106,7 +145,7 @@ class EDM2Loss:
     def __call__(self, net, images, labels=None, global_step=None):
         rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         ######### Parameters for schedulers ##########
-        T = 36000000
+        T = 24000000
         P_mean_s = 0.85
         start_guidance = False
         guidance_min_gamma = 1.5
@@ -163,21 +202,21 @@ class EDM2Loss:
         loss = (weight / logvar.exp()) * ((denoised - images) ** 2) + logvar
         
         # combine losses
-        interpolation = normal_and_guidance_interpolation_scheduler(global_step, T=torch.tensor(T).to(images.device), initial=0.1, final=0.7)
+        weights = slope_based_scheduler(loss.mean(), loss_guidance, step=global_step)
         
         # if global_step < 15340000:
         #     start_guidance = True
-        loss = loss + g_score_scale * loss_guidance
+        loss = loss + weights[1] * loss_guidance
         # else: start_guidance = False
         # loss = torch.vmap(lambda a, b: a * b)(loss, loss_guidance)
         # loss = loss_guidance
 
-        dist.print0(f'guidance start: {start_guidance}, interpolation {interpolation} global_step {global_step}, guidance_loss {loss_guidance}, g_score_scale {g_score_scale:.12f}, loss {loss.mean().item():.4f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}')
+        dist.print0(f'guidance start: {start_guidance}, weights {weights}, global_step {global_step}, guidance_loss {loss_guidance}, g_score_scale {g_score_scale:.12f}, loss {loss.mean().item():.4f}, sigma {sigma.mean().item():.4f}, sigma_s {sigma_s.mean().item():.4f}')
 
         
         # loss = loss.mean() + loss_guidance
         training_mode = f"{T}-{mode}--{P_mean_s}"
-        return loss, g_score_scale, training_mode, loss_guidance, interpolation
+        return loss, g_score_scale, training_mode, loss_guidance, weights
         
         # rnd_normal = torch.randn([images.shape[0], 1, 1, 1], device=images.device)
         # sigma = (rnd_normal * self.P_std + self.P_mean).exp()
@@ -311,7 +350,7 @@ def training_loop(
     start_nimg = state.cur_nimg
     stats_jsonl = None
     loss_history = []
-    while True and state.cur_nimg < 36000000:
+    while True and state.cur_nimg < 24000000:
         done = (state.cur_nimg >= stop_at_nimg)
 
         # Report status.
@@ -409,11 +448,12 @@ def training_loop(
             with misc.ddp_sync(ddp, (round_idx == num_accumulation_rounds - 1)):
                 images, labels = next(dataset_iterator)
                 images = encoder.encode_latents(images.to(device))
-                loss, g_score_scale, training_mode, loss_guidance, interpolation = loss_fn(net=ddp, images=images, labels=labels.to(device), global_step=state.cur_nimg)
+                loss, g_score_scale, training_mode, loss_guidance, weights = loss_fn(net=ddp, images=images, labels=labels.to(device), global_step=state.cur_nimg)
                 training_stats.report('Loss/loss', loss)
                 training_stats.report('Loss/loss_guidance', loss_guidance)
                 training_stats.report('Loss/guidance_min_max_difference', loss_guidance.max() - loss_guidance.min())
-                training_stats.report('Loss/interpolation', interpolation)
+                training_stats.report('Loss/guidance_scale', weights[1])
+                training_stats.report('Loss/primary_scale', weights[0])
                 scalar_loss = float(loss.mean().detach().cpu().item())
                 # dist.print0(f'mean loss: {np.mean(loss_history[:-100])}, cur loss: {scalar_loss}')
                 if len(loss_history) > 100 and not \
